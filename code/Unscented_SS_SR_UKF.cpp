@@ -9,15 +9,12 @@ Data is output via Serial1 pins (POS,VEL,ACCELEROMETER BIASES,INERTIAL->BODY QUA
 
 TO-DO
 
+Pressure first and second derivative
 Altimeter Updating (HIGH) (in progress)
 EGM-2008 Onboard modeling (LOW (but can work for altimeter update)) (in progress...)
-WMM Onboard modeling (LOW) (would be awesome if we can update expected magnetic field for long range missions)
-^XYZ geoMag?
 fix barometer function (HIGH) (in progress)
 magnetometer unexpected lockout? (MODERATE)
 Mach number compensation/lockout (HIGH)
-
-GPS data discard (LOW) Done!? (maybe additional overrides but I trust the isValid() statement)
 Manual Mode (HIGH) (in progress)
 test transmission functions (HIGH) (in progress)
 
@@ -25,7 +22,8 @@ Testing! (HIGH) In Progress...
 
 COMPLETE
 
-
+WMM Onboard modeling (LOW) (would be awesome if we can update expected magnetic field for long range missions)
+^XYZ geoMag?
 Double check/set correct rates for IMU (HIGH)
 magnetometer calibration(HIGH)
 re-verify magnetometer function (HIGH) 
@@ -120,7 +118,7 @@ tachometer observer
   const double gyroScale=((M_PI/180)/65.5);//conversion from Raw Data to Rad/s
   const double accelScale=9.81/2048.0f;//Conversion from Raw Data to m/s/s
   Eigen::Vector3d magBias=Eigen::Vector3d::Zero();
-  Eigen::Vector3d magScale (1,1,1);
+  Eigen::Matrix3d magScale;
   #define MPU_ADDR 0x68
   #define MAG_ADDR 0x0C
   #include <Wire.h>
@@ -128,6 +126,8 @@ tachometer observer
   #include <TinyGPS++.h>
   #include <SD.h>
   #include <SPI.h>
+  #include <Adafruit_BMP280.h>
+  Adafruit_BMP280 bmp;
   const int chipSelect = BUILTIN_SDCARD;//For Teensy 4.1 onboard SD
   Eigen::Vector3d mag;//magnetometer reading
   Eigen::Matrix<double,6,1> rates;//raw body rates from IMU
@@ -146,19 +146,20 @@ tachometer observer
   #define printPropogationProb true //prints covariance update math
   #define printMeas true//prints the sigma points and matricies used in the measure function
 //weather stuff
-  #define lapseRate 1
-  #define Rdry 287.05287//J/kg/K
-  #define Rvap 461.51
   #define LaunchHeight 50
   #define SemiMajor 6378137
   #define SemiMajorSq 6378137.0*6378137.0
   #define SemiMinorSq 6356752.314245*6356752.314245
   #define ecc 1/298.257223563
+  float year;//decimal year
   double Undulation;
-  double groundTemp;//Ground temperature in deg K
-  double groundPres;//Ground Pressure in Pa
+  float pressure;//pressure in inHg
+  float temperature;//temp in K
+  float groundTemp;//Ground temperature in deg K
+  float groundPres;//Ground Pressure in inHg
   double groundAlt;//Launch altitude  in m
   double QNH;
+  #include "XYZgeomag.hpp"
 //UKF stuff
   Eigen::Matrix<double,StateNum,StateNum> Sx;
   Eigen::Matrix<double, StateNum,1> y_mean;
@@ -179,7 +180,8 @@ tachometer observer
   Eigen::Vector3d inertialNorth;
   Eigen::Vector3d inertialEast;
   double dt;//previous loop's time step in s
-  Eigen::Vector3d initialCoords;//what it says it is (XYZ ofc)                                                                                                                                                                                                                                                                                                                       Easter Egg
+  Eigen::Vector3d initialCoords;//what it says it is (XYZ ofc)
+  double InitalHeightMSL;                                                                                                                                                                                                                                                                                                                       //Easter Egg
 //Radio Stuff
   #define Ebyte Serial3
   enum Radio{
@@ -204,6 +206,8 @@ tachometer observer
   uint8_t retryCount=0;//how many times we've tried to send the packet
   const uint8_t maxRetrys=3;//how many times we will retry packet transmission before giving up
 //Control Stuff
+#define DROGUEPIN 19
+#define MAINPIN 18
   uint8_t mode=0;//0 for UKF reliant, 1 for raw sensor reliant
   uint8_t drogueOverride=1;//starts with both chute overrides enabled
   uint8_t mainOverride=1;
@@ -211,6 +215,7 @@ tachometer observer
   uint8_t mainDeploy=0;
   uint8_t drogueDesired=0;//if the computer will try to deploy drogue/main if left on auto
   uint8_t mainDesired=0;
+  #define DEPLOYHEIGHT 250;//height in MSL to deploy main 
 //Sensor functions 
 void writeByte(uint8_t addr, uint8_t reg, uint8_t val) {//I2C stuff
   Wire.beginTransmission(addr);
@@ -276,8 +281,7 @@ bool getMag(Eigen::Ref<Eigen::Matrix<double,3,1>> Mag){
   Mag(1) = mx;
   Mag(0) = my;
   Mag(2) = -mz;
-  Mag*=0.3
-  Mag=(Mag-magBias).cwiseProduct(magScale);//CHANGE Double check this
+  Mag=magScale*(Mag-magBias);//CHANGE Double check this
 
   if(DEBUG){
     Serial.println("Magnetometer Got!");
@@ -285,6 +289,18 @@ bool getMag(Eigen::Ref<Eigen::Matrix<double,3,1>> Mag){
   }
 
   return true;
+}
+void blinkLED(int times, int wait){
+  //blinks onboard LED times times, turning on and then off for delay seconds No waiting delays for a single blink
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(wait);
+  digitalWrite(LED_BUILTIN, LOW);
+  for(int i=1; i<times; i++){
+    delay(wait);
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(wait);
+    digitalWrite(LED_BUILTIN, LOW);
+  }
 }
 void init9150() {//resets and turns on MPU, sets rates, and enables magnetometer bypass
   Wire.setClock(100000);//Setting I2C clock to 100kHz
@@ -366,6 +382,8 @@ void cholUpdate(Eigen::MatrixBase<DerivedS>& S,  const Eigen::MatrixBase<Derived
     Serial.println("weight");
     Serial.println(w);
   }
+
+    //Adding a small jitter to improve stability
     auto& Sm=S.derived();
     Eigen::VectorXd x=x_in;
     const int n = Sm.rows();
@@ -377,9 +395,6 @@ void cholUpdate(Eigen::MatrixBase<DerivedS>& S,  const Eigen::MatrixBase<Derived
     for (int k = 0; k < n; ++k)
     {
         double r = std::sqrt(Sm(k,k)*Sm(k,k) + sign * x(k)*x(k));
-        if(isnan(r)){
-          r=0.02;//prevents super small variances from blowing up filter
-        }
         double c = r / Sm(k,k);
         double s = x(k) / Sm(k,k);
         printMatrix(x.transpose());
@@ -436,14 +451,20 @@ Eigen::Matrix<double,StateNum,1> Propogate(Eigen::Ref<Eigen::VectorXd> state,Eig
     modRodParam=-modRodParam/modRodParam.squaredNorm();
   }
   Eigen::Matrix<double,3,1> accel=rates.segment(0,3)-state.segment(6,3)+proc.segment(0,3);//accel rates - accel biases + accel noise
-  Eigen::Vector3d bodyRate=rates.segment(3,3)+proc.segment(3,3)-state.segment(12,3);//rates that differ from the mean point's rate
+  Eigen::Vector3d bodyRate=(rates.segment(3,3)+proc.segment(3,3)-state.segment(12,3))*dt;//rates that differ from the mean point's rate
   Eigen::Quaterniond thisInerToBody;//Quaternion Correction from IF->Body small angle rotation error
   Eigen::Quaterniond IFRotError;
   IFRotError.w()=(1-modRodParam.squaredNorm())/(1+modRodParam.squaredNorm());
   IFRotError.vec()=2*modRodParam/(1+modRodParam.squaredNorm());
   Eigen::Quaterniond update;//Quaternion Correction from deviation from mean rates
-  update.w()=1;
-  update.vec()=0.5*bodyRate*dt;
+  double angle=bodyRate.norm();//change in angle during this propogation
+  if(angle<1e-8){
+    update.w()=1;
+    update.vec()=0.5*bodyRate;
+  }else{
+    update.w()=cos(angle/2);
+    update.vec()=bodyRate.normalized()*sin(angle/2);
+  }
   update.normalize();
   //update angular error with QuatCorrect*inerToBody.conj()=dQ
   //update orientation with inerToBody*angErr=dQ
@@ -486,9 +507,9 @@ Eigen::Matrix<double,StateNum,1> Propogate(Eigen::Ref<Eigen::VectorXd> state,Eig
   PropState.segment(0,3)=Pos;
   PropState.segment(3,3)=Vel;
   PropState.segment(9,3)=IFRotError.vec()/(1+IFRotError.w());
-  if(PropState.segment(9,3).norm()>1){
-    PropState.segment(9,3)=-(PropState.segment(9,3))/PropState.segment(9,3).squaredNorm();
-  }
+  //if(PropState.segment(9,3).norm()>1){
+  //  PropState.segment(9,3)=-(PropState.segment(9,3))/PropState.segment(9,3).squaredNorm();
+  //}
   if(printPropogations){
     Serial.println("Propogated State");
     printMatrix(PropState.transpose());
@@ -540,9 +561,18 @@ void sigPointsProp(){//Propogates model
   Eigen::Matrix<double,StateNum,N> X_pred;
   Eigen::Matrix<double,ProcNum,1> w_i;
   Eigen::Quaterniond dQ;
-  dQ.w()=1;
-  dQ.vec()=(rates.segment(3,3)-x_mean.segment(12,3))*dt*0.5;
+  Eigen::Vector3d bodyRate=(rates.segment(3,3)-SigPoints.col(0).segment(12,3))*dt;
+  double angle=bodyRate.norm();
+  if(angle<1e-8){
+    dQ.w()=1;
+    dQ.vec()=0.5*bodyRate;
+  }else{
+    dQ.w()=cos(angle/2);
+    dQ.vec()=bodyRate.normalized()*sin(angle/2);
+  }
+  dQ.normalize();
   nextInerToBody=inerToBody*dQ;
+  nextInerToBody.normalize();
   for (int i = 0; i < N; ++i)
     {
         x_i = SigPoints.col(i).segment(0, StateNum);
@@ -577,6 +607,8 @@ void sigPointsProp(){//Propogates model
     // Rank-1 update with 0th sigma point
     Eigen::VectorXd dx0 = (X_pred.col(0) - x_mean);
     cholUpdate(Sx, dx0, w(0));//Needs Scaling?
+    Sx.diagonal().segment(6,3)+=Eigen::Vector3d::Constant((1e-3)*dt);
+    Sx.diagonal().segment(12,3)+=Eigen::Vector3d::Constant((1e-4)*dt);
     if(printPropogationProb){
       Serial.println("dx0");
       printMatrix(dx0.transpose());
@@ -590,6 +622,7 @@ template<int Nm, typename Func>
 void Meas(const Eigen::Matrix<double,Nm,1>& z,const Eigen::Matrix<double,Nm,Nm>& R, Func h,bool isVector){
   //SS-SR-UKF measurement function. if measurement is a Normalized vector, isVector should be true
   Eigen::Matrix<double,Nm,L+2> Y;
+  Eigen::Vector3d y_hat;
   for (int i = 0; i < L+2; ++i){
     
     Y.col(i) = h(SigPoints.col(i).segment(0,StateNum));
@@ -597,19 +630,31 @@ void Meas(const Eigen::Matrix<double,Nm,1>& z,const Eigen::Matrix<double,Nm,Nm>&
   //something is failing in the magnetometer section. vector measurements are way higher than expected
   Eigen::Matrix<double,Nm,1>  y_mean = Y * w;
   if(isVector){
-    y_mean.normalize();//makes y_mean into an averaged vector instead of direct average
+    //Eigen::Matrix<double,StateNum,1> tempMean=x_mean;
+    //tempMean.segment(9,3)=avgRot(SigPoints.block(9,0,3,N),w);
+    //y_hat=h(tempMean);//makes y_mean into an averaged vector instead of direct average
+    y_hat=y_mean.normalized();
   }
   Eigen::Matrix<double,Nm,Nm> Sy;
   Eigen::Matrix<double,Nm,N-1> A;
   for (int i=1; i<N; i++){
+    if(isVector){
+    A.col(i-1)=sqrt(abs(w(i)))*(Y.col(i).cross(y_hat));
+    }else{
     A.col(i-1)=sqrt(abs(w(i)))*(Y.col(i)-y_mean);
+    }
   }
   Eigen::Matrix<double, Nm, (Nm+N-1)> B;
   B.leftCols(N-1)=A;
   B.rightCols(Nm)=R;
   Eigen::HouseholderQR<Eigen::MatrixXd> qr(B.transpose());
   Sy=qr.matrixQR().topLeftCorner(Nm,Nm).template triangularView<Eigen::Upper>();
-  Eigen::Vector<double,Nm>dy0=Y.col(0)-y_mean;
+  Eigen::Vector<double,Nm>dy0;
+  if(isVector){
+    dy0=Y.col(0).cross(y_hat);
+  }else{
+    dy0=Y.col(0)-y_mean;
+  }
   if(printMeas){
     Serial.println("A matrix");
     printMatrix(A);
@@ -626,23 +671,38 @@ void Meas(const Eigen::Matrix<double,Nm,1>& z,const Eigen::Matrix<double,Nm,Nm>&
   cholUpdate(Sy,dy0,w(0));
   Eigen::Matrix<double,StateNum,Nm> Pxy=Eigen::Matrix<double,StateNum,Nm>::Zero();
   for(int i=0; i<N; i++){
-    Pxy+=w(i)*(SigPoints.col(i).segment(0,StateNum)-x_mean)*(Y.col(i)-y_mean).transpose();
+    if(isVector){
+      Pxy+=w(i)*(SigPoints.col(i).segment(0,StateNum)-x_mean)*(Y.col(i).cross(y_hat)).transpose();
+    }else{
+      Pxy+=w(i)*(SigPoints.col(i).segment(0,StateNum)-x_mean)*(Y.col(i)-y_mean).transpose();
+    }
   }//CHANGE wgat?
   Eigen::Matrix<double,Nm,Nm> SyT=Sy.transpose();
   Eigen::Matrix<double,Nm,StateNum> PxyT=Pxy.transpose().eval();//Pxy Transpose matrix
   Eigen::Matrix<double,Nm,StateNum> tmp=Sy.template triangularView<Eigen::Upper>().solve(PxyT);
   Eigen::Matrix<double,Nm,StateNum> Kt=Sy.transpose().template triangularView<Eigen::Lower>().solve(tmp);
   Eigen::Matrix<double,StateNum,Nm> K=Kt.transpose();
-  x_mean+=K*(z-y_mean);
+  if(isVector){
+    x_mean+=K*(z.cross(y_mean));
+  }else{
+    x_mean+=K*(z-y_mean);
+  }
   if(printMeas){
     Serial.println("Pxy");
     printMatrix(Pxy);
     Serial.println("Z");
     printMatrix(z);
+    if(isVector){
+      Serial.println("Y_mean");
+    printMatrix(y_hat);
+    Serial.println("z-y");
+    printMatrix(z.cross(y_hat));
+    }else{
     Serial.println("Y_mean");
     printMatrix(y_mean);
     Serial.println("z-y");
     printMatrix(z-y_mean);
+    }
     Serial.println("SyT");
     printMatrix(SyT);
     Serial.println("PxyT");
@@ -838,6 +898,23 @@ void MagUpdate(){
   GenSigPoints();
 }
 //Initialization Functions
+void getMagField(){
+  geomag::Vector out;
+  geomag::Vector in;
+  in.x=initialCoords(0)+x_mean(0);
+  in.y=initialCoords(1)+x_mean(1);
+  in.z=initialCoords(2)+x_mean(2);
+  out=geomag::GeoMag(year,in,geomag::WMM2025);//Model accurate through 2029
+  //updates magDir
+  magDir(0)=out.x;
+  magDir(1)=out.y;
+  magDir(2)=out.z;
+  magDir.normalize();
+  if(DEBUG){
+    Serial.println("IF magnetic field");
+    printMatrix(magDir.transpose());
+  }
+}
 void getOrientation(Eigen::Vector3d a, Eigen::Vector3d m){//gets initial organization using triad with magnetometer and gravity direction
   if(DEBUG){
     Serial.println("Getting Orientation...");
@@ -867,7 +944,7 @@ void getOrientation(Eigen::Vector3d a, Eigen::Vector3d m){//gets initial organiz
     Serial.println("DOWN, NORTH, EAST I.F. DIRECTIONS (columns)");
     printMatrix(IFRmat);
   }
-  magDir=IFRmat*magDir;
+  //magDir=IFRmat*magDir;
   Eigen::Vector3d magNorth=magDir-inertialDown*(inertialDown.dot(magDir));// Magnetic North Vector in inertial frame
   magNorth.normalize();
   IFRmat.col(1)=magNorth;
@@ -876,7 +953,7 @@ void getOrientation(Eigen::Vector3d a, Eigen::Vector3d m){//gets initial organiz
   //IFRmat North vector now aligns with magnetic north tangent to ellipsoid
   //now putting Inertial->Body rotation matrix into BodyRmat
   BodyRmat=BodyRmat*IFRmat.transpose();
-  magDir=BodyRmat.transpose()*m;
+  //magDir=BodyRmat.transpose()*m;
   //and setting Inertial to Body quaternion
   inerToBody=Eigen::Quaterniond(BodyRmat);
   if(DEBUG){
@@ -894,22 +971,24 @@ void getOrientation(Eigen::Vector3d a, Eigen::Vector3d m){//gets initial organiz
   }
 }
 void calibrateMag(){
-  bool Calibration=true;
   Eigen::Vector3d m;
   Eigen::Matrix<double,3,Eigen::Dynamic> tempEllipsoid;
   for(int i=0; i<3; i++){
-    if(DEBUG){
-      Serial.print("Please hold axis ");
-      Serial.print(i);
-      Serial.println(" vertical");
-    }
-    Eigen::Vector3d downAxis=Eigen::Vector3d::Zero();
-    downAxis(i)=1;//
-      while(abs(rates.segment(0,3).normalized().dot(downAxis))<0.975){
+    for(int j=0; j<2; j++){
+      if(DEBUG){
+        Serial.print("Please hold axis ");
+        Serial.print(i);
+        Serial.println(" vertical");
+      }
+      Eigen::Vector3d downAxis=Eigen::Vector3d::Zero();
+      downAxis(i)=j*-2+1;//
+      while(rates.segment(0,3).normalized().dot(downAxis)<0.975){
         //repeats until accelerometer measures straight down (within 15 ish degrees)
         rates=getINS();
-        delay(100);
+        blinkLED(1,round(100*(1-rates.segment(0,3).normalized().dot(downAxis))));//blinks faster as you approach the selected axis
+        delay(round(100*(1-rates.segment(0,3).normalized().dot(downAxis))));
       }
+      blinkLED(3,300);//three slow blinks once you find the axis
       if(DEBUG){
         Serial.println("Please rotate around axis slowly");
       }
@@ -921,59 +1000,76 @@ void calibrateMag(){
       lastMillis=millis();
       while (abs(rotationAngle)<2.125*M_PI){
         //requires 382.5 degrees of rotation about the selected axis
-        rates=getINS();
-        dt=double((millis()-lastMillis)/1000.0f);
-        Serial.println(millis());
-        Serial.println(lastMillis);
-        lastMillis=millis();
-        if(abs(rates.segment(0,3).normalized().dot(downAxis))>0.8){
-          rotationAngle+=rates(3+i)*dt;
-          if(DEBUG){
-            Serial.println(dt*1000);
-            Serial.println("rotationAngle");
-            Serial.println(rotationAngle*180/M_PI);
+          rates=getINS();
+          dt=double((millis()-lastMillis)/1000.0f);
+          Serial.println(millis());
+          Serial.println(lastMillis);
+          lastMillis=millis();
+          if(rates.segment(0,3).normalized().dot(downAxis)>0.8){
+            rotationAngle+=rates(3+i)*dt;
+            if(DEBUG){
+              Serial.println(dt*1000);
+              Serial.println("rotationAngle");
+              Serial.println(rotationAngle*180/M_PI);
+            }
+            if(abs(lastAng-rotationAngle)>0.09){
+              getMag(m);
+              tempMag.conservativeResize(3,n+1);
+              tempMag.col(n)=m;
+              n++;
+              lastAng=rotationAngle;
+              if(DEBUG) Serial.println("Point Saved!");
+            }
+            Serial.println("keep going...");
+            delay(50);
+          }else{
+            if(DEBUG) Serial.println("HOLD AXIS DOWN");
           }
-          if(abs(lastAng-rotationAngle)>0.09){
-            getMag(m);
-            tempMag.conservativeResize(3,n+1);
-            tempMag.col(n)=m;
-            n++;
-            lastAng=rotationAngle;
-            if(DEBUG) Serial.println("Point Saved!");
-          }
-          Serial.println("keep going...");
           delay(50);
-        }else{
-          if(DEBUG) Serial.println("HOLD AXIS DOWN");
         }
-        delay(50);
-      }
         tempEllipsoid.conservativeResize(3,tempEllipsoid.cols()+tempMag.cols());
         tempEllipsoid.rightCols(tempMag.cols())=tempMag;
+    }
   }
   //Ellipsoid Fitting!
   if(DEBUG){
     Serial.println("Fitting Ellipsoid...");
   }
-  Eigen::Matrix<double,Eigen::Dynamic,7> Mat(tempEllipsoid.cols(),7);
+  Eigen::Matrix<double,Eigen::Dynamic,10> Mat(tempEllipsoid.cols(),10);
   for(int i=0; i<tempEllipsoid.cols(); i++){
     Eigen::Vector3d temp=tempEllipsoid.col(i);
     for(int j=0; j<3; j++){
-      Mat(i,j)=temp(j)*temp(j);
-      Mat(i,j+3)=temp(j);
+      Mat(i,j)=temp(j)*temp(j);//x^2, y^2, z^2
+      Mat(i,j+6)=temp(j);//x,y,z
     }
-    Mat(i,6)=1;
+    Mat(i,3)=temp(0)*temp(1);//xy
+    Mat(i,4)=temp(0)*temp(2);//xz
+    Mat(i,5)=temp(1)*temp(2);//yz
+    Mat(i,9)=1;
   }
   Eigen::JacobiSVD<Eigen::MatrixXd> svd(Mat,Eigen::ComputeFullV);
-  Eigen::VectorXd p=svd.matrixV().col(6);
-  for (int i=0; i<3; i++){
-    magBias(i)=-p(i+3)/(2*p(i));
+  Eigen::VectorXd p=svd.matrixV().col(9);
+  printMatrix(p);
+  p/=-p(6);//normalize ellipsoid
+  Eigen::Matrix3d Q;
+  Q<<p(0),p(3)/2,p(4)/2,
+    p(3)/2,p(1),p(5)/2,
+    p(4)/2,p(5)/2,p(2);
+  Eigen::Vector3d b(p(6),p(7),p(8));
+
+  magBias=-0.5*Q.inverse()*b;
+
+  double k=magBias.transpose()*Q*magBias+b.dot(magBias)+p(9);
+  Eigen::Matrix3d A=Q/(-k);
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(A);
+  Eigen::Matrix3d V=eig.eigenvectors();
+  Eigen::Vector3d D=eig.eigenvalues();
+  if((D.array()<=0).any()){
+    Serial.println("Ellipsoid fit fail");
   }
-  double k=p(6)+(magBias.cwiseAbs2()).transpose()*p.segment(0,3);
-  for (int i=0; i<3; i++){
-    magScale(i)=sqrt(-k/p(i));
-    magScale/=magDir.norm();
-  }
+  Eigen::Matrix3d sqrtD=D.cwiseSqrt().asDiagonal();
+  magScale=V*sqrtD*V.transpose();
+  printMatrix(magScale);
 }
 //SD logging functions
 Eigen::Matrix<double,25,1> FlightData(){
@@ -1099,7 +1195,7 @@ void getTXData(uint8_t ID){
     case 2:{
       //Orientation Packet
       Txlength=36;
-      Eigen::Matrix<float,3,1> tempMRP=x_mean.segment(9,3).cast<float>();
+      Eigen::Matrix<float,3,1> tempMRP=(inerToBody.vec()/(1+interToBody.w())).cast<float>();
       Eigen::Matrix<float,3,1> tempAngRate=rates.segment(3,3).cast<float>();
       Eigen::Matrix<float,3,1> tempMag=mag.cast<float>();
       for(int i=0; i<3; i++){
@@ -1124,7 +1220,10 @@ void getTXData(uint8_t ID){
     }
     case 4:{
       //Weather Packet
-
+      memcpy(&TxData[0],&pressure,4);
+      //CHANGE, needs first and second pressure derivatives
+      memcpy(&Txdata[12],&temperature,4);
+      //we don't get humidity on BMP-280
       break;
     }
     case 5:{
@@ -1262,6 +1361,40 @@ void transmit(){//Handles Data recieving/transmitting
 //Control Functions
 void ControlRocket(){
   //handles and checks for chute staging 
+  /*
+    uint8_t mode=0;//0 for UKF reliant, 1 for raw sensor reliant
+  uint8_t drogueOverride=1;//starts with both chute overrides enabled
+  uint8_t mainOverride=1;
+  uint8_t drogueDeploy=0;//True if Drogue/Main is deployed or deploying
+  uint8_t mainDeploy=0;
+  uint8_t drogueDesired=0;//if the computer will try to deploy drogue/main if left on auto
+  uint8_t mainDesired=0;
+  */
+  //Deployment Conditions
+  if(mode==0){
+    double Vspeed=-inertialDown.transpose()*x_mean.segment(3,3)+(inertialDown.cwiseAbs().dot(Sx.diagonal().segment(3,3)));//V speed - error in Vspeed
+    if(Vspeed>-5){
+      drogueDesired=1;
+    }
+  }else{
+    //CHANGE Insert Pressure based deployment conditions
+  }
+  if(drogueOverride!=1){
+    if(drogueDesired==1){
+      drogueDeploy=1;
+    }
+  }
+  if(drogueDeploy==1){
+  digitalWrite(DROGUEPIN,HIGH);
+  }
+  if(mainOverride!=1){
+    if(mainDesired==1){
+      mainDeploy=1;
+    }
+  }
+  if(mainDeploy==1){
+    digitalWrite(MAINPIN,HIGH);
+  }
 }
 //Weather Functions
 /*coming soon
@@ -1318,22 +1451,39 @@ double getUndulation(Eigen::Vector3d POS){
 }
 */
 void setup() {
-  magDir<<49.617,19.0754,-1.3327;//CHANGE XYZ geomag library
+  //magDir<<49.617,19.0754,-1.3327;//CHANGE XYZ geomag library
+  magScale.diagonal()=Eigen::Vector3d::Constant(1);
   //CHANGE magNorm checks
-  magDir.normalize();
   Serial.begin(115200);
   Serial1.begin(9600);//Starting GPS line
   while(!Serial1);//waiting for GPS line to start
   Wire.begin();//Starting I2C line
   delay(1000);
   Serial.println("=======Initializing=======");
+  unsigned status;
+  status=bmp.begin();
+  if(!status){
+    Serial.print("BMP 280 initialization failed.");
+  }
+  bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,    
+                  Adafruit_BMP280::SAMPLING_X2,     
+                  Adafruit_BMP280::SAMPLING_X16,    
+                  Adafruit_BMP280::FILTER_X16,      
+                  Adafruit_BMP280::STANDBY_MS_63);
+  groundTemp=bmp.readTemperature()+273.15;
+  groundPres=bmp.readPressure()/3386;
+  if(DEBUG){
+    Serial.println("Ground Temperature in K");
+    Serial.println(groundTemp);
+    Serial.println("Ground Pressure in in Hg");
+    Serial.println(groundPres);
+  }
   init9150();
   if(!SD.begin(chipSelect)){
     Serial.println("SD card initialization error");
   }
   delay(500);
   //Getting our initial position and covariance
-  
   while(true){
     Serial.println("Waiting for GPS...");
     while(Serial1.available()>0){
@@ -1344,12 +1494,20 @@ void setup() {
     }
     Serial.println(gps.charsProcessed());
     if(gps.location.isUpdated()&&gps.location.isValid()&&gps.altitude.isValid()&&gps.hdop.isValid()){
+      year=static_cast<float>(gps.date.year());
+      year+=static_cast<float>(gps.date.month())/12;
+      if(DEBUG){
+        Serial.println("Decimal Year");
+        Serial.println(year);
+      }
       break;
     }
     delay(50);
   }
   Eigen::Matrix<double,6,1>GPSDat=GetGps();
-  initialCoords=GPSDat.segment(0,3);//setting up our launch area. transmit this to ground station in pre-launch package
+  initialCoords=GPSDat.segment(0,3);
+  x_mean.segment(0,3)=Eigen::Vector3d::Zero();
+  getMagField();
   Serial.println("Got GPS");
   startDataLog();
   if(DEBUG){
@@ -1375,7 +1533,8 @@ void setup() {
     printMatrix(magScale);
     Serial.println("Now hold still for orientation");
   }
-  delay(500);
+  blinkLED(10,100);//Blinks LED 10 times over 2 seconds
+  magDir.normalize();
   while ((deltaAccDev>0.1&&deltaMagDev>0.1)||n<50){//repeats loop until both vectors have a cahnge in variance of <=0.1 rad after at least 50 samples
     delay(100);
     a=getINS().segment(0,3);
@@ -1411,18 +1570,18 @@ void setup() {
   //Setting up our uncertainties
   Eigen::Matrix<double,StateNum,1> StateCov=Eigen::Matrix<double,StateNum,1>::Constant(1);
   StateCov.head(3)=GPSDat.segment(3,3).cast<double>();
-  StateCov.segment(3,3)=Eigen::Vector3d::Constant(10);//velocity initialized with 1 m/s variance
-  StateCov.segment(6,3)=Eigen::Vector3d::Constant(3);//accelerometer bias initialized with 0.5m/s/s variance
-  StateCov.segment(9,3)=Eigen::Vector3d::Constant(0.10);//Small angle assumtion, variance in heading error is equal to sum of recorded gravity and magnetic variances
-  StateCov.segment(12,3)=Eigen::Vector3d::Constant(0.5);//gyro bias initialized with 0.5 rad/s error (roughly 15deg/s)
+  StateCov.segment(3,3)=Eigen::Vector3d::Constant(1);//velocity initialized with 1 m/s variance
+  StateCov.segment(6,3)=Eigen::Vector3d::Constant(0.7);//accelerometer bias initialized with 0.5m/s/s variance
+  StateCov.segment(9,3)=Eigen::Vector3d::Constant(0.1);//Small angle assumtion, variance in heading error is equal to sum of recorded gravity and magnetic variances
+  StateCov.segment(12,3)=Eigen::Vector3d::Constant(0.05);//gyro bias initialized with 0.5 rad/s error (roughly 15deg/s)
   //StateCov.segment(15,2)=Eigen::Vector2d::Constant(0.5);//magnetometer offset for both axis intialized with 0.1rad variance (roughly 5deg)
   //StateCov(17)=1.0f;//Change this when I know what I'm doing
   //^CHANGE hopefully overwritten with future magnetometer calibration routine
   Sx=StateCov.asDiagonal();
   //Setting up our process noises
   Eigen::Matrix<double,ProcNum,1> ProcCov=Eigen::Matrix<double,ProcNum,1>::Constant(0.4);//CHANGE Flush this out later
-  ProcCov.segment(0,3)=Eigen::Vector3d::Constant(0.3);//additve accelerimeter noise
-  ProcCov.segment(3,3)=Eigen::Vector3d::Constant(0.1);//additive gyro noise
+  ProcCov.segment(0,3)=Eigen::Vector3d::Constant(1);//additve accelerimeter noise
+  ProcCov.segment(3,3)=Eigen::Vector3d::Constant(0.3);//additive gyro noise (super high)
   //CHANGE add walk bias modeling
   Sw=ProcCov.asDiagonal();
   if(DEBUG){
@@ -1439,23 +1598,16 @@ void setup() {
   }
   GenSigPoints();
   //Some constant R matricies are set up here
-  RMag=Eigen::Vector3d::Constant(0.4).asDiagonal();//change something better
+  RMag=Eigen::Vector3d::Constant(0.17).asDiagonal();//change something better
   RStill=Eigen::Matrix<double,6,1>::Constant(4).asDiagonal();
   //CHANGE Send pre launch package and await ON command here
-  delay(500);
+  blinkLED(7,50);//Blinks LED 7 times in 0.7 ish seconds
   rates=getINS();
   lastMillis=millis();
 }
 float magtimer=0;
 void loop() {
-
-  if(DEBUG){
-    Serial.println("Loop Started");
-  }
-  if(DEBUG){
-    Serial.println("New Sigma Points (Col Vectors)");
-    printMatrix(SigPoints);
-  }
+  recieve();
   //Update Timers
   dt=double((millis()-lastMillis))/1000.0f;
   lastMillis=millis();
@@ -1464,9 +1616,19 @@ void loop() {
   Time+=dt;
   magtimer+=dt;
   //propogate the model with new dt, get rates for next propogation
+  if(!Sx.hasNaN()){
+    if(DEBUG){
+    Serial.println("Loop Started");
+  }
+  if(DEBUG){
+    Serial.println("New Sigma Points (Col Vectors)");
+    printMatrix(SigPoints);
+  }
   sigPointsProp();
   GenSigPoints();
   rates=getINS();
+  temperature=bmp.readTemperature()+273.15;
+  pressure=bmp.readPressure()/3386;
   //check timer and log data to SD card
   if(logTimer>1){
     if(DEBUG){
@@ -1506,6 +1668,8 @@ void loop() {
   if(DEBUG){
     Serial.println("End of Loop");
   }
+  controlRocket();
+  transmit();
+  }
   
-  delay(10);//adding a small delay so we never go >100hz (MPU9150 max rate) (CHANGE later maybe)
 }
