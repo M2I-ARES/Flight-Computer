@@ -1,33 +1,216 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Rocket Telemetry</title>
-    <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
+    <title>Hyperion Rocket Dashboard</title>
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        #map { height: 400px; width: 100%; margin-bottom: 20px; }
+        .data-section { display: flex; flex-wrap: wrap; gap: 20px; }
+        .data-panel { border: 1px solid #ccc; padding: 10px; width: 300px; background-color: #f9f9f9; }
+        .data-panel h3 { margin-top: 0; }
+        .data-item { margin: 5px 0; }
+    </style>
 </head>
 <body>
-    <h1>🚀 Rocket Telemetry</h1>
 
-    <div id="alt"></div>
-    <div id="pos"></div>
-    <div id="vel"></div>
-    <div id="acc"></div>
+<h1>Hyperion Rocket Dashboard</h1>
 
-    <script>
-        var socket = io();
+<div id="map"></div>
 
-        socket.on("telemetry", function(data) {
-            document.getElementById("alt").innerHTML =
-                "Altitude: " + data.alt.toFixed(2);
+<div class="data-section">
+    <div class="data-panel">
+        <h3>Position (ECEF)</h3>
+        <div class="data-item">X: <span id="pos-x">--</span> m</div>
+        <div class="data-item">Y: <span id="pos-y">--</span> m</div>
+        <div class="data-item">Z: <span id="pos-z">--</span> m</div>
+    </div>
+    <div class="data-panel">
+        <h3>Velocity (ECEF)</h3>
+        <div class="data-item">Vx: <span id="vel-x">--</span> m/s</div>
+        <div class="data-item">Vy: <span id="vel-y">--</span> m/s</div>
+        <div class="data-item">Vz: <span id="vel-z">--</span> m/s</div>
+    </div>
+    <div class="data-panel">
+        <h3>Acceleration</h3>
+        <div class="data-item">Ax: <span id="acc-x">--</span> m/s²</div>
+        <div class="data-item">Ay: <span id="acc-y">--</span> m/s²</div>
+        <div class="data-item">Az: <span id="acc-z">--</span> m/s²</div>
+    </div>
+    <div class="data-panel">
+        <h3>Inertial→Body Quaternion</h3>
+        <div class="data-item">W: <span id="quat-0">--</span></div>
+        <div class="data-item">X: <span id="quat-1">--</span></div>
+        <div class="data-item">Y: <span id="quat-2">--</span></div>
+        <div class="data-item">Z: <span id="quat-3">--</span></div>
+    </div>
+    <div class="data-panel">
+        <h3>Accel Biases</h3>
+        <div class="data-item">X: <span id="ab-x">--</span> m/s²</div>
+        <div class="data-item">Y: <span id="ab-y">--</span> m/s²</div>
+        <div class="data-item">Z: <span id="ab-z">--</span> m/s²</div>
+        <h3 style="margin-top:10px">Gyro Biases</h3>
+        <div class="data-item">X: <span id="gb-x">--</span> °/s</div>
+        <div class="data-item">Y: <span id="gb-y">--</span> °/s</div>
+        <div class="data-item">Z: <span id="gb-z">--</span> °/s</div>
+    </div>
+    <div class="data-panel">
+        <h3>Magnetometer</h3>
+        <div class="data-item">X: <span id="mag-x">--</span></div>
+        <div class="data-item">Y: <span id="mag-y">--</span></div>
+        <div class="data-item">Z: <span id="mag-z">--</span></div>
+    </div>
+    <div class="data-panel">
+        <h3>Angular Rate (Body)</h3>
+        <div class="data-item">Roll:  <span id="ar-x">--</span> °/s</div>
+        <div class="data-item">Pitch: <span id="ar-y">--</span> °/s</div>
+        <div class="data-item">Yaw:   <span id="ar-z">--</span> °/s</div>
+    </div>
+    <div class="data-panel">
+        <h3>State Uncertainty (1σ)</h3>
+        <div class="data-item">Pos X: <span id="up-x">--</span> m</div>
+        <div class="data-item">Pos Y: <span id="up-y">--</span> m</div>
+        <div class="data-item">Pos Z: <span id="up-z">--</span> m</div>
+        <div class="data-item">Vel X: <span id="uv-x">--</span> m/s</div>
+        <div class="data-item">Vel Y: <span id="uv-y">--</span> m/s</div>
+        <div class="data-item">Vel Z: <span id="uv-z">--</span> m/s</div>
+        <div class="data-item">Heading: <span id="hdg-err">--</span> °</div>
+    </div>
+    <div class="data-panel">
+        <h3>Altitude</h3>
+        <div class="data-item">MSL: <span id="alt">--</span> m</div>
+        <div class="data-item">Lat: <span id="lat">--</span> °</div>
+        <div class="data-item">Lon: <span id="lon">--</span> °</div>
+    </div>
+    <div class="data-panel">
+        <h3>Recovery Systems</h3>
+        <div class="data-item">Drogue Deployed: <span id="drogue-deploy">--</span></div>
+        <div class="data-item">Main Deployed:   <span id="main-deploy">--</span></div>
+        <div class="data-item">Drogue Desired:  <span id="drogue-desired">--</span></div>
+        <div class="data-item">Main Desired:    <span id="main-desired">--</span></div>
+        <div class="data-item">Drogue Override: <span id="drogue-override">--</span></div>
+        <div class="data-item">Main Override:   <span id="main-override">--</span></div>
+        <div class="data-item">Mission Time:    <span id="fc-time">--</span> s</div>
+    </div>
+</div>
 
-            document.getElementById("pos").innerHTML =
-                "Position: " + data.pos;
+<script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
-            document.getElementById("vel").innerHTML =
-                "Velocity: " + data.vel;
+<script>
+    const socket = io();
 
-            document.getElementById("acc").innerHTML =
-                "Acceleration: " + data.acc;
-        });
-    </script>
+    const map = L.map('map').setView([42.0000, -93.0000], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const rocketIcon = L.icon({
+        iconUrl: "https://cdn-icons-png.flaticon.com/512/3212/3212608.png",
+        iconSize: [40, 40], iconAnchor: [20, 20]
+    });
+    const marker = L.marker([42.0000, -93.0000], { icon: rocketIcon }).addTo(map);
+
+    function set(id, val) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = (val !== null && val !== undefined) ? val : '--';
+    }
+
+    socket.on('telemetry', (data) => {
+        // Map
+        if (data.lat && data.lon) {
+            marker.setLatLng([data.lat, data.lon]);
+            map.panTo([data.lat, data.lon]);
+        }
+
+        // Position
+        if (data.position) {
+            set('pos-x', data.position[0]);
+            set('pos-y', data.position[1]);
+            set('pos-z', data.position[2]);
+        }
+
+        // Velocity
+        if (data.velocity) {
+            set('vel-x', data.velocity[0]);
+            set('vel-y', data.velocity[1]);
+            set('vel-z', data.velocity[2]);
+        }
+
+        // Acceleration
+        if (data.acceleration) {
+            set('acc-x', data.acceleration[0]);
+            set('acc-y', data.acceleration[1]);
+            set('acc-z', data.acceleration[2]);
+        }
+
+        // Quaternion (converted from MRP by server)
+        if (data.quaternion) {
+            set('quat-0', data.quaternion[0]);
+            set('quat-1', data.quaternion[1]);
+            set('quat-2', data.quaternion[2]);
+            set('quat-3', data.quaternion[3]);
+        }
+
+        // Biases
+        if (data.accel_bias) {
+            set('ab-x', data.accel_bias[0]);
+            set('ab-y', data.accel_bias[1]);
+            set('ab-z', data.accel_bias[2]);
+        }
+        if (data.gyro_bias) {
+            set('gb-x', data.gyro_bias[0]);
+            set('gb-y', data.gyro_bias[1]);
+            set('gb-z', data.gyro_bias[2]);
+        }
+
+        // Magnetometer
+        if (data.magnetometer) {
+            set('mag-x', data.magnetometer[0]);
+            set('mag-y', data.magnetometer[1]);
+            set('mag-z', data.magnetometer[2]);
+        }
+
+        // Angular rate
+        if (data.ang_rate) {
+            set('ar-x', data.ang_rate[0]);
+            set('ar-y', data.ang_rate[1]);
+            set('ar-z', data.ang_rate[2]);
+        }
+
+        // Uncertainty
+        if (data.pos_std) {
+            set('up-x', data.pos_std[0]);
+            set('up-y', data.pos_std[1]);
+            set('up-z', data.pos_std[2]);
+        }
+        if (data.vel_std) {
+            set('uv-x', data.vel_std[0]);
+            set('uv-y', data.vel_std[1]);
+            set('uv-z', data.vel_std[2]);
+        }
+        if (data.heading_err !== undefined) set('hdg-err', data.heading_err);
+
+        // Altitude & geodetic
+        if (data.altitude !== null && data.altitude !== undefined) set('alt', data.altitude);
+        if (data.lat !== null) set('lat', data.lat);
+        if (data.lon !== null) set('lon', data.lon);
+
+        // Controls
+        if (data.controls) {
+            const c = data.controls;
+            set('drogue-deploy',   c.drogue_deploy   ? 'YES' : 'NO');
+            set('main-deploy',     c.main_deploy     ? 'YES' : 'NO');
+            set('drogue-desired',  c.drogue_desired  ? 'YES' : 'NO');
+            set('main-desired',    c.main_desired    ? 'YES' : 'NO');
+            set('drogue-override', c.drogue_override ? 'ON'  : 'OFF');
+            set('main-override',   c.main_override   ? 'ON'  : 'OFF');
+        }
+        if (data.time !== undefined) set('fc-time', data.time);
+    });
+</script>
+
 </body>
 </html>
